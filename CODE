@@ -1,0 +1,1039 @@
+package com.example.fluentenglishin60days;
+
+import android.Manifest;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
+import android.graphics.Color;
+import android.media.AudioManager;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.media.MediaMuxer;
+import android.media.MediaRecorder;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
+import android.text.Layout;
+import android.text.Spannable;
+import android.text.SpannableString;
+import android.text.style.BackgroundColorSpan;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageButton;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.fragment.app.Fragment;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
+
+public class RecordingFragment extends Fragment {
+
+    // Constants
+    private static final String ARG_SELECTED_TITLE = "selectedTitle";
+    private static final String ARG_ACTIVITY_TYPE = "activityType";
+    private static final String UTTERANCE_ID = "ttsUtterance";
+    private static final int REQUEST_RECORD_AUDIO_PERMISSION = 200;
+    private static final String FEMALE_VOICE_OFFLINE = "en-us-x-tpc-local";
+    private static final String FEMALE_VOICE_ONLINE = "en-us-x-tpc-network";
+    private static final String MALE_VOICE_OFFLINE = "en-us-x-iom-local";
+    private static final String MALE_VOICE_ONLINE = "en-us-x-iom-network";
+    private static final long MIN_PAUSE_DURATION = 1000;
+    private static final long MAX_PAUSE_DURATION = 10000;
+    private static final long TTS_WARMUP_DELAY = 200;
+    private static final long AUDIO_FOCUS_DELAY = 200;
+    private static final int BLINK_INTERVAL = 500;
+    private static final int COLOR_RED = Color.RED;
+    private static final int COLOR_TRANSPARENT = Color.TRANSPARENT;
+
+    // UI Components
+    private TextView passageContent;
+    private TextView recordingStatus;
+    private ImageButton micButton, stopButton, voiceSelectionButton, recordingBarButton;
+    private ScrollView scrollView;
+
+    // Text-to-Speech
+    private TextToSpeech tts;
+    private Handler handler = new Handler();
+    private boolean useMaleVoice = false;
+    private boolean voiceAvailable = false;
+    private boolean voicesLoaded = false;
+    private boolean loadingVoices = false;
+    private long lastTtsDuration = MIN_PAUSE_DURATION;
+    private long ttsStartTime = 0;
+
+    // Passage Data
+    private List<String> passageTitles = new ArrayList<>();
+    private List<String> passages = new ArrayList<>();
+    private List<Sentence> sentences = new ArrayList<>();
+    private int currentIndex = 0;
+    private int currentSentenceIndex = 0;
+    private SpannableString spannableText;
+    private String selectedTitle;
+    private String activityType;
+
+    // Recording State
+    private boolean isRecording = false;
+    private boolean shouldContinueRecording = false;
+    private boolean isSpeaking = false;
+    private boolean isUserRecording = false;
+    private boolean isWaitingForUser = false;
+    private Runnable pauseTimeoutRunnable;
+    private long sentenceStartTime = 0;
+    private boolean isBlinking = false;
+    private Runnable blinkRunnable;
+
+    // Audio Components
+    private MediaRecorder mediaRecorder;
+    private String currentRecordingPath;
+    private List<String> recordedAudioPaths = new ArrayList<>();
+    private boolean isProcessingRecording = false;
+    private AudioManager audioManager;
+    private AudioManager.OnAudioFocusChangeListener audioFocusChangeListener;
+
+    // Network Monitoring
+    private BroadcastReceiver networkChangeReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!isNetworkAvailable()) {
+                showNoInternetDialog();
+            } else {
+                if (tts != null && !loadingVoices) {
+                    loadAvailableVoices();
+                }
+            }
+        }
+    };
+
+    private class Sentence {
+        int start;
+        int end;
+        String text;
+
+        public Sentence(int start, int end, String text) {
+            this.start = start;
+            this.end = end;
+            this.text = text;
+        }
+    }
+
+    public static RecordingFragment newInstance(String selectedTitle, String activityType) {
+        RecordingFragment fragment = new RecordingFragment();
+        Bundle args = new Bundle();
+        args.putString(ARG_SELECTED_TITLE, selectedTitle);
+        args.putString(ARG_ACTIVITY_TYPE, activityType);
+        fragment.setArguments(args);
+        return fragment;
+    }
+
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (getArguments() != null) {
+            selectedTitle = getArguments().getString(ARG_SELECTED_TITLE);
+            activityType = getArguments().getString(ARG_ACTIVITY_TYPE);
+        }
+
+        audioManager = (AudioManager) requireContext().getSystemService(Context.AUDIO_SERVICE);
+        audioFocusChangeListener = focusChange -> {
+            if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                    focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                pauseRecording();
+            }
+        };
+
+        initializeTts();
+    }
+
+    @Override
+    public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
+        View view = inflater.inflate(R.layout.fragment_recording, container, false);
+
+        scrollView = view.findViewById(R.id.scrollView);
+        passageContent = view.findViewById(R.id.passageContent);
+        recordingStatus = view.findViewById(R.id.recordingStatus);
+        micButton = view.findViewById(R.id.micButton);
+        stopButton = view.findViewById(R.id.stopButton);
+        voiceSelectionButton = view.findViewById(R.id.voiceSelectionButton);
+        recordingBarButton = view.findViewById(R.id.recordingbar);
+
+        setStatusText("Initializing...");
+        micButton.setEnabled(false);
+        stopButton.setVisibility(View.GONE);
+
+        voiceSelectionButton.setOnClickListener(v -> {
+            stopRecordingSession();
+            showVoiceSelectionDialog();
+        });
+
+        micButton.setOnClickListener(v -> startRecordingSession());
+        stopButton.setOnClickListener(v -> showStopRecordingConfirmation());
+
+        recordingBarButton.setOnClickListener(v -> {
+            handleFragmentSwitch();
+            navigateToSavedConversations();
+        });
+
+        loadPassageDataFromFile();
+        updateContent();
+
+        IntentFilter filter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
+        requireContext().registerReceiver(networkChangeReceiver, filter);
+
+        return view;
+    }
+
+    private void initializeTts() {
+        tts = new TextToSpeech(requireContext(), status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                int langResult = tts.setLanguage(Locale.US);
+                if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Log.e("TTS", "Language not supported");
+                    showErrorDialog("English language pack not available");
+                }
+
+                tts.playSilentUtterance(100, TextToSpeech.QUEUE_FLUSH, "warmup");
+
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {
+                        ttsStartTime = System.currentTimeMillis();
+                        handler.post(() -> {
+                            isSpeaking = true;
+                            isWaitingForUser = false;
+                            setStatusText("\uD83D\uDD0A Listen carefully...");
+                            scrollToCurrentSentence();
+                            startBlinkingStopButton();
+                        });
+                    }
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        lastTtsDuration = System.currentTimeMillis() - ttsStartTime;
+                        lastTtsDuration = Math.max(MIN_PAUSE_DURATION, Math.min(lastTtsDuration, MAX_PAUSE_DURATION));
+
+                        handler.post(() -> {
+                            if (!shouldContinueRecording || !isCurrentSentenceIndexValid()) {
+                                stopBlinkingStopButton();
+                                return;
+                            }
+
+                            isWaitingForUser = true;
+                            setStatusText("\uD83C\uDFA4 Record...");
+
+                            if (shouldContinueRecording) {
+                                try {
+                                    startUserRecording();
+                                    isUserRecording = true;
+
+                                    pauseTimeoutRunnable = () -> {
+                                        if (!shouldContinueRecording || !isUserRecording) {
+                                            return;
+                                        }
+
+                                        stopUserRecording();
+                                        isUserRecording = false;
+
+                                        if (isCurrentSentenceIndexValid() && currentSentenceIndex < sentences.size() - 1) {
+                                            currentSentenceIndex++;
+                                            highlightCurrentSentence();
+                                            speakCurrentSentence();
+                                        } else {
+                                            stopRecordingSession();
+                                            combineAndSaveRecordings();
+                                        }
+                                    };
+
+                                    handler.postDelayed(pauseTimeoutRunnable, lastTtsDuration);
+                                } catch (Exception e) {
+                                    Log.e("Recording", "Error in recording callback", e);
+                                    stopRecordingSession();
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        handler.post(() -> {
+                            isSpeaking = false;
+                            isWaitingForUser = false;
+                            stopRecordingSession();
+                            setStatusText("Error occurred during playback");
+                            stopBlinkingStopButton();
+                        });
+                    }
+                });
+
+                loadAvailableVoices();
+                handler.post(() -> setStatusText("Ready"));
+            } else {
+                showErrorDialog("Text-to-speech initialization failed");
+            }
+        }, "com.google.android.tts");
+    }
+
+    private void startBlinkingStopButton() {
+        if (isBlinking) return;
+
+        isBlinking = true;
+        blinkRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (!isBlinking) return;
+
+                if (stopButton.getTag() == null || stopButton.getTag().equals(COLOR_TRANSPARENT)) {
+                    stopButton.setColorFilter(COLOR_RED);
+                    stopButton.setTag(COLOR_RED);
+                } else {
+                    stopButton.setColorFilter(COLOR_TRANSPARENT);
+                    stopButton.setTag(COLOR_TRANSPARENT);
+                }
+
+                handler.postDelayed(this, BLINK_INTERVAL);
+            }
+        };
+        handler.post(blinkRunnable);
+    }
+
+    private void stopBlinkingStopButton() {
+        isBlinking = false;
+        if (blinkRunnable != null) {
+            handler.removeCallbacks(blinkRunnable);
+        }
+        stopButton.setColorFilter(null);
+        stopButton.setTag(null);
+    }
+
+    private boolean isCurrentSentenceIndexValid() {
+        return currentSentenceIndex >= 0 && currentSentenceIndex < sentences.size();
+    }
+
+    private void loadAvailableVoices() {
+        if (loadingVoices) return;
+
+        loadingVoices = true;
+        voiceAvailable = false;
+
+        new Thread(() -> {
+            int retries = 0;
+            while (tts.getVoices() == null && retries < 5) {
+                try {
+                    Thread.sleep(200);
+                    retries++;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+
+            requireActivity().runOnUiThread(() -> {
+                voiceAvailable = setPreferredVoice(useMaleVoice);
+                voicesLoaded = true;
+                loadingVoices = false;
+
+                if (voiceAvailable) {
+                    micButton.setEnabled(true);
+                } else {
+                    showVoiceNotAvailableToast();
+                    micButton.setEnabled(false);
+                }
+            });
+        }).start();
+    }
+
+    private boolean setPreferredVoice(boolean malePreferred) {
+        if (tts == null) return false;
+
+        tts.stop();
+        isSpeaking = false;
+
+        if (isNetworkAvailable()) {
+            if (malePreferred) {
+                if (setVoice(MALE_VOICE_ONLINE)) return true;
+                if (setVoice(MALE_VOICE_OFFLINE)) return true;
+            } else {
+                if (setVoice(FEMALE_VOICE_ONLINE)) return true;
+                if (setVoice(FEMALE_VOICE_OFFLINE)) return true;
+            }
+        }
+
+        if (malePreferred) {
+            if (setVoice(MALE_VOICE_OFFLINE)) return true;
+        } else {
+            if (setVoice(FEMALE_VOICE_OFFLINE)) return true;
+        }
+
+        return setDefaultVoice();
+    }
+
+    private boolean setVoice(String voiceName) {
+        Set<Voice> voices = tts.getVoices();
+        if (voices == null) return false;
+
+        for (Voice voice : voices) {
+            if (voice.getName().equals(voiceName)) {
+                return tts.setVoice(voice) == TextToSpeech.SUCCESS;
+            }
+        }
+        return false;
+    }
+
+    private boolean setDefaultVoice() {
+        return tts.getDefaultVoice() != null &&
+                tts.setVoice(tts.getDefaultVoice()) == TextToSpeech.SUCCESS;
+    }
+
+    private void startRecordingSession() {
+        if (!voicesLoaded) {
+            Toast.makeText(requireContext(), "Voices are still loading, please wait...", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(requireActivity(),
+                    new String[]{Manifest.permission.RECORD_AUDIO},
+                    REQUEST_RECORD_AUDIO_PERMISSION);
+            return;
+        }
+
+        if (!requestAudioFocus()) {
+            showErrorDialog("Cannot record audio right now");
+            return;
+        }
+
+        handler.postDelayed(() -> {
+            try {
+                recordedAudioPaths.clear();
+                shouldContinueRecording = true;
+                isRecording = true;
+                micButton.setVisibility(View.GONE);
+                stopButton.setVisibility(View.VISIBLE);
+
+                currentSentenceIndex = 0;
+                highlightCurrentSentence();
+                speakCurrentSentence();
+            } catch (Exception e) {
+                Log.e("Recording", "Failed to start recording session", e);
+                stopRecordingSession();
+            }
+        }, AUDIO_FOCUS_DELAY);
+    }
+
+    private boolean requestAudioFocus() {
+        int result = audioManager.requestAudioFocus(
+                audioFocusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private void stopRecordingSession() {
+        shouldContinueRecording = false;
+        isRecording = false;
+        isUserRecording = false;
+        isWaitingForUser = false;
+        stopBlinkingStopButton();
+
+        if (pauseTimeoutRunnable != null) {
+            handler.removeCallbacks(pauseTimeoutRunnable);
+        }
+
+        if (tts != null && isSpeaking) {
+            tts.stop();
+            isSpeaking = false;
+        }
+
+        stopUserRecording();
+
+        handler.post(() -> {
+            micButton.setVisibility(View.VISIBLE);
+            stopButton.setVisibility(View.GONE);
+            setStatusText("Ready");
+            clearTextHighlight();
+        });
+
+        audioManager.abandonAudioFocus(audioFocusChangeListener);
+    }
+
+    private void pauseRecording() {
+        if (isRecording) {
+            stopRecordingSession();
+        }
+    }
+
+    private void startUserRecording() {
+        try {
+            File outputDir = requireContext().getCacheDir();
+            File outputFile = File.createTempFile("user_audio_" + System.currentTimeMillis(), ".m4a", outputDir);
+            currentRecordingPath = outputFile.getAbsolutePath();
+
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            mediaRecorder.setAudioSamplingRate(44100);
+            mediaRecorder.setAudioEncodingBitRate(192000);
+            mediaRecorder.setOutputFile(currentRecordingPath);
+
+            mediaRecorder.prepare();
+            mediaRecorder.start();
+            isUserRecording = true;
+        } catch (Exception e) {
+            Log.e("Recording", "Failed to start user recording", e);
+            stopRecordingSession();
+        }
+    }
+
+    private void stopUserRecording() {
+        try {
+            if (mediaRecorder != null) {
+                if (isUserRecording) {
+                    try {
+                        mediaRecorder.stop();
+                    } catch (IllegalStateException e) {
+                        Log.e("Recording", "Stop failed - no valid data", e);
+                    }
+                }
+                mediaRecorder.release();
+
+                if (isUserRecording && currentRecordingPath != null) {
+                    if (isAudioFileValid(currentRecordingPath)) {
+                        recordedAudioPaths.add(currentRecordingPath);
+                    } else {
+                        Log.w("Recording", "Invalid audio file, skipping: " + currentRecordingPath);
+                        new File(currentRecordingPath).delete();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e("Recording", "Failed to stop user recording", e);
+            if (currentRecordingPath != null) {
+                new File(currentRecordingPath).delete();
+            }
+        } finally {
+            mediaRecorder = null;
+            isUserRecording = false;
+        }
+    }
+
+    private boolean isAudioFileValid(String filePath) {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(filePath);
+            return extractor.getTrackCount() > 0;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            extractor.release();
+        }
+    }
+
+    private void speakCurrentSentence() {
+        if (tts == null || !isCurrentSentenceIndexValid()) {
+            return;
+        }
+
+        Sentence sentence = sentences.get(currentSentenceIndex);
+        Bundle params = new Bundle();
+        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID);
+
+        handler.postDelayed(() -> {
+            tts.speak(sentence.text, TextToSpeech.QUEUE_FLUSH, params, UTTERANCE_ID);
+        }, TTS_WARMUP_DELAY);
+    }
+
+    private void loadPassageDataFromFile() {
+        InputStream inputStream = getResources().openRawResource(R.raw.passages);
+        BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+        StringBuilder contentBuilder = new StringBuilder();
+        String line;
+        try {
+            String title = "";
+            boolean isTitleFound = false;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("Title:")) {
+                    if (isTitleFound) {
+                        passages.add(contentBuilder.toString().trim());
+                        contentBuilder = new StringBuilder();
+                    }
+                    title = line.substring("Title:".length()).trim();
+                    passageTitles.add(title);
+                    isTitleFound = true;
+                } else if (isTitleFound) {
+                    contentBuilder.append(line).append("\n");
+                }
+            }
+            if (isTitleFound) {
+                passages.add(contentBuilder.toString().trim());
+            }
+            reader.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void updateContent() {
+        if (selectedTitle != null) {
+            currentIndex = passageTitles.indexOf(selectedTitle);
+            if (currentIndex >= 0 && currentIndex < passages.size()) {
+                String passageText = passages.get(currentIndex);
+                passageContent.setText(passageText);
+                spannableText = new SpannableString(passageText);
+                passageContent.setText(spannableText);
+
+                parseSentences(passageText);
+
+                if (voicesLoaded && voiceAvailable) {
+                    micButton.setEnabled(true);
+                }
+            }
+        }
+    }
+
+    private void parseSentences(String text) {
+        sentences.clear();
+        String[] rawSentences = text.split("(?<=[.!?])\\s+");
+        int currentPosition = 0;
+
+        for (String sentence : rawSentences) {
+            int start = text.indexOf(sentence, currentPosition);
+            if (start == -1) start = currentPosition;
+            int end = start + sentence.length();
+            sentences.add(new Sentence(start, end, sentence));
+            currentPosition = end;
+        }
+
+        if (sentences.isEmpty() && !text.isEmpty()) {
+            sentences.add(new Sentence(0, text.length(), text));
+        }
+
+        currentSentenceIndex = 0;
+    }
+
+    private void highlightCurrentSentence() {
+        if (spannableText == null || !isCurrentSentenceIndexValid()) return;
+
+        clearTextHighlight();
+
+        Sentence sentence = sentences.get(currentSentenceIndex);
+        int highlightColor = getHighlightColor();
+
+        spannableText.setSpan(
+                new BackgroundColorSpan(highlightColor),
+                sentence.start,
+                sentence.end,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+        );
+        passageContent.setText(spannableText);
+        scrollToCurrentSentence();
+    }
+
+    private void clearTextHighlight() {
+        if (spannableText != null) {
+            BackgroundColorSpan[] spans = spannableText.getSpans(0, spannableText.length(), BackgroundColorSpan.class);
+            for (BackgroundColorSpan span : spans) {
+                spannableText.removeSpan(span);
+            }
+            passageContent.setText(spannableText);
+        }
+    }
+
+    private void scrollToCurrentSentence() {
+        if (passageContent == null || !isCurrentSentenceIndexValid()) {
+            return;
+        }
+
+        Sentence current = sentences.get(currentSentenceIndex);
+        Layout layout = passageContent.getLayout();
+        if (layout != null) {
+            int line = layout.getLineForOffset(current.start);
+            int y = layout.getLineTop(line);
+
+            int scrollViewHeight = scrollView.getHeight();
+            int textHeight = passageContent.getHeight();
+            int desiredY = y - (scrollViewHeight / 3);
+
+            desiredY = Math.max(0, Math.min(desiredY, textHeight - scrollViewHeight));
+
+            scrollView.smoothScrollTo(0, desiredY);
+        }
+    }
+
+    private int getHighlightColor() {
+        int nightModeFlags = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        if (nightModeFlags == Configuration.UI_MODE_NIGHT_YES) {
+            return Color.argb(255, 100, 181, 246);
+        } else {
+            return Color.YELLOW;
+        }
+    }
+
+    private void setStatusText(String text) {
+        recordingStatus.setText(text);
+    }
+
+    private void showStopRecordingConfirmation() {
+        stopRecordingSession();
+
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Save Recording")
+                .setMessage("Are you sure you want to save recording?")
+                .setPositiveButton("Yes", (dialog, which) -> {
+                    if (!recordedAudioPaths.isEmpty()) {
+                        new Handler().postDelayed(() -> {
+                            combineAndSaveRecordings();
+                        }, 500);
+                    } else {
+                        Toast.makeText(requireContext(),
+                                "No valid recordings to save",
+                                Toast.LENGTH_SHORT).show();
+                        resetFragment();
+                    }
+                })
+                .setNegativeButton("No", (dialog, which) -> {
+                    for (String path : recordedAudioPaths) {
+                        new File(path).delete();
+                    }
+                    recordedAudioPaths.clear();
+                    resetFragment();
+                })
+                .setCancelable(false)
+                .show();
+    }
+
+    private void combineAndSaveRecordings() {
+        if (isProcessingRecording) return;
+
+        isProcessingRecording = true;
+        setStatusText("Saving Recording...");
+
+        new Thread(() -> {
+            try {
+                List<String> validPaths = new ArrayList<>();
+                for (String path : recordedAudioPaths) {
+                    if (path != null && new File(path).exists() && isAudioFileValid(path)) {
+                        validPaths.add(path);
+                    } else {
+                        Log.w("Recording", "Invalid audio file, skipping: " + path);
+                        if (path != null) {
+                            new File(path).delete();
+                        }
+                    }
+                }
+
+                if (validPaths.isEmpty()) {
+                    throw new IOException("No valid recordings to combine");
+                }
+
+                String combinedPath = combineAudioFiles(validPaths);
+                if (combinedPath != null) {
+                    saveRecordingToStorage(combinedPath);
+                }
+
+                for (String path : validPaths) {
+                    new File(path).delete();
+                }
+
+                handler.post(() -> {
+                    isProcessingRecording = false;
+                    navigateToSavedConversations();
+                });
+            } catch (Exception e) {
+                handler.post(() -> {
+                    isProcessingRecording = false;
+                    showErrorDialog("Failed to save recording: " + e.getMessage());
+                });
+            }
+        }).start();
+    }
+
+    private String combineAudioFiles(List<String> inputPaths) throws IOException {
+        if (inputPaths == null || inputPaths.isEmpty()) {
+            throw new IOException("No audio files to combine");
+        }
+
+        MediaMuxer muxer = null;
+        String outputPath = null;
+
+        try {
+            // Change to use app's internal storage
+            File outputDir = new File(requireContext().getFilesDir(), "FluentEnglishRecordings");
+            if (!outputDir.exists() && !outputDir.mkdirs()) {
+                throw new IOException("Failed to create output directory");
+            }
+
+            String safeTitle = selectedTitle.replaceAll("[^a-zA-Z0-9.-]", "_");
+            outputPath = new File(outputDir,
+                    safeTitle + "_" + System.currentTimeMillis() / 1000 + ".m4a").getAbsolutePath();
+
+            // Rest of the method remains the same...
+            muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            int trackIndex = -1;
+            long totalDurationUs = 0;
+
+            for (String inputPath : inputPaths) {
+                MediaExtractor extractor = new MediaExtractor();
+                try {
+                    extractor.setDataSource(inputPath);
+                    int trackCount = extractor.getTrackCount();
+
+                    for (int i = 0; i < trackCount; i++) {
+                        MediaFormat format = extractor.getTrackFormat(i);
+                        String mime = format.getString(MediaFormat.KEY_MIME);
+
+                        if (mime != null && mime.startsWith("audio/")) {
+                            extractor.selectTrack(i);
+
+                            if (trackIndex == -1) {
+                                trackIndex = muxer.addTrack(format);
+                                muxer.start();
+                            }
+
+                            ByteBuffer inputBuffer = ByteBuffer.allocate(1024 * 1024);
+                            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
+                            while (true) {
+                                int sampleSize = extractor.readSampleData(inputBuffer, 0);
+                                if (sampleSize < 0) {
+                                    break;
+                                }
+
+                                bufferInfo.offset = 0;
+                                bufferInfo.size = sampleSize;
+                                bufferInfo.flags = MediaCodec.BUFFER_FLAG_CODEC_CONFIG;
+                                bufferInfo.presentationTimeUs = extractor.getSampleTime() + totalDurationUs;
+
+                                muxer.writeSampleData(trackIndex, inputBuffer, bufferInfo);
+                                if (!extractor.advance()) {
+                                    break;
+                                }
+                            }
+                            totalDurationUs += format.getLong(MediaFormat.KEY_DURATION);
+                        }
+                    }
+                } finally {
+                    extractor.release();
+                }
+            }
+        } catch (Exception e) {
+            if (outputPath != null) {
+                new File(outputPath).delete();
+            }
+            throw e;
+        } finally {
+            if (muxer != null) {
+                try {
+                    muxer.stop();
+                } catch (IllegalStateException e) {
+                    Log.e("AudioMuxer", "Error stopping muxer", e);
+                }
+                muxer.release();
+            }
+        }
+
+        return outputPath;
+    }
+    private void saveRecordingToStorage(String filePath) {
+        try {
+            SharedPreferences prefs = requireContext().getSharedPreferences("Recordings", Context.MODE_PRIVATE);
+            Set<String> recordings = prefs.getStringSet("recording_list", new HashSet<>());
+
+            Set<String> updatedRecordings = new HashSet<>(recordings);
+            String recordingName = selectedTitle + "_" +
+                    new SimpleDateFormat("mmss", Locale.getDefault()).format(new Date());
+
+            updatedRecordings.add(recordingName + "|" + filePath);
+
+            prefs.edit()
+                    .putStringSet("recording_list", updatedRecordings)
+                    .apply();
+
+            handler.post(() -> Toast.makeText(requireContext(),
+                    "Recording saved successfully",
+                    Toast.LENGTH_SHORT).show());
+        } catch (Exception e) {
+            Log.e("Recording", "Failed to save recording info", e);
+            handler.post(() -> Toast.makeText(requireContext(),
+                    "Failed to save recording info",
+                    Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    private void navigateToSavedConversations() {
+        if (isAdded() && getActivity() != null && !getActivity().isFinishing()) {
+            try {
+                Intent intent = new Intent(requireContext(), SavedConversationsActivity.class);
+                intent.putExtra("passage_title", selectedTitle);
+                startActivity(intent);
+            } catch (Exception e) {
+                Log.e("Navigation", "Failed to navigate to SavedConversationsActivity", e);
+                Toast.makeText(requireContext(),
+                        "Could not open saved recordings",
+                        Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void handleFragmentSwitch() {
+        if (isRecording || isSpeaking || isUserRecording) {
+            stopRecordingSession();
+            showRecordingStoppedToast();
+
+            for (String path : recordedAudioPaths) {
+                new File(path).delete();
+            }
+            recordedAudioPaths.clear();
+
+            resetFragment();
+        }
+    }
+
+    private void showRecordingStoppedToast() {
+        Toast.makeText(requireContext(),
+                "Recording has been stopped",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private void resetFragment() {
+        currentSentenceIndex = 0;
+        clearTextHighlight();
+        setStatusText("Ready");
+        micButton.setVisibility(View.VISIBLE);
+        stopButton.setVisibility(View.GONE);
+    }
+
+    private void showVoiceSelectionDialog() {
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Select Voice")
+                .setSingleChoiceItems(
+                        new String[]{"Female Voice", "Male Voice"},
+                        useMaleVoice ? 1 : 0,
+                        (dialog, which) -> {
+                            boolean newMalePreference = (which == 1);
+                            if (newMalePreference != useMaleVoice) {
+                                useMaleVoice = newMalePreference;
+                                voiceAvailable = setPreferredVoice(useMaleVoice);
+                                dialog.dismiss();
+                            }
+                        })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showErrorDialog(String message) {
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Error")
+                .setMessage(message)
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    private void showVoiceNotAvailableToast() {
+        Toast.makeText(requireContext(),
+                "Preferred voice not available. Using default voice.",
+                Toast.LENGTH_LONG).show();
+    }
+
+    private boolean isNetworkAvailable() {
+        ConnectivityManager connectivityManager =
+                (ConnectivityManager) requireContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
+        return activeNetworkInfo != null && activeNetworkInfo.isConnected();
+    }
+
+    private void showNoInternetDialog() {
+        new AlertDialog.Builder(requireContext())
+                .setTitle("No Internet Connection")
+                .setMessage("Some features require internet. Please connect to continue.")
+                .setPositiveButton("Retry", (dialog, which) -> {
+                    if (isNetworkAvailable()) {
+                        updateContent();
+                    } else {
+                        showNoInternetDialog();
+                    }
+                })
+                .setNegativeButton("Exit", (dialog, which) -> requireActivity().finish())
+                .setCancelable(false)
+                .show();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_RECORD_AUDIO_PERMISSION) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startRecordingSession();
+            } else {
+                Toast.makeText(requireContext(),
+                        "Permission denied - cannot record audio", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        stopBlinkingStopButton();
+        if (isRecording || isSpeaking || isUserRecording) {
+            stopRecordingSession();
+            showRecordingStoppedToast();
+
+            for (String path : recordedAudioPaths) {
+                new File(path).delete();
+            }
+            recordedAudioPaths.clear();
+
+            resetFragment();
+        }
+    }
+
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        stopRecordingSession();
+        stopBlinkingStopButton();
+        if (tts != null) {
+            tts.stop();
+            tts.setOnUtteranceProgressListener(null);
+            tts.shutdown();
+        }
+        handler.removeCallbacksAndMessages(null);
+        requireContext().unregisterReceiver(networkChangeReceiver);
+    }
+
+}
