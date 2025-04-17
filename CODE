@@ -13,6 +13,7 @@ import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
+import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -78,6 +79,8 @@ public class RecordingFragment extends Fragment {
     private static final int BLINK_INTERVAL = 500;
     private static final int COLOR_RED = Color.RED;
     private static final int COLOR_TRANSPARENT = Color.TRANSPARENT;
+    private static final String TTS_AUDIO_PREFIX = "tts_";
+    private static final String USER_AUDIO_PREFIX = "user_";
 
     // UI Components
     private TextView passageContent;
@@ -123,6 +126,7 @@ public class RecordingFragment extends Fragment {
     private boolean isProcessingRecording = false;
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener audioFocusChangeListener;
+    private MediaPlayer ttsMediaPlayer;
 
     // Network Monitoring
     private BroadcastReceiver networkChangeReceiver = new BroadcastReceiver() {
@@ -270,7 +274,7 @@ public class RecordingFragment extends Fragment {
                                         if (isCurrentSentenceIndexValid() && currentSentenceIndex < sentences.size() - 1) {
                                             currentSentenceIndex++;
                                             highlightCurrentSentence();
-                                            speakCurrentSentence();
+                                            recordAndPlayTtsAudio();
                                         } else {
                                             stopRecordingSession();
                                             combineAndSaveRecordings();
@@ -446,12 +450,57 @@ public class RecordingFragment extends Fragment {
 
                 currentSentenceIndex = 0;
                 highlightCurrentSentence();
-                speakCurrentSentence();
+                recordAndPlayTtsAudio();
             } catch (Exception e) {
                 Log.e("Recording", "Failed to start recording session", e);
                 stopRecordingSession();
             }
         }, AUDIO_FOCUS_DELAY);
+    }
+
+    private void recordAndPlayTtsAudio() {
+        if (!isCurrentSentenceIndexValid()) return;
+
+        Sentence sentence = sentences.get(currentSentenceIndex);
+        try {
+            // Create file for TTS audio
+            File outputDir = requireContext().getCacheDir();
+            File ttsOutputFile = File.createTempFile(TTS_AUDIO_PREFIX + System.currentTimeMillis(), ".m4a", outputDir);
+            String ttsAudioPath = ttsOutputFile.getAbsolutePath();
+
+            // Setup TTS to output to file
+            Bundle params = new Bundle();
+            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID);
+            params.putString(TextToSpeech.Engine.KEY_PARAM_VOLUME, "1.0");
+
+            // Record TTS to file
+            int result = tts.synthesizeToFile(sentence.text, params, ttsOutputFile, UTTERANCE_ID);
+            if (result == TextToSpeech.SUCCESS) {
+                // Play the recorded TTS audio
+                if (ttsMediaPlayer != null) {
+                    ttsMediaPlayer.release();
+                }
+                ttsMediaPlayer = new MediaPlayer();
+                ttsMediaPlayer.setDataSource(ttsAudioPath);
+                ttsMediaPlayer.prepare();
+                ttsMediaPlayer.start();
+
+                ttsMediaPlayer.setOnCompletionListener(mp -> {
+                    mp.release();
+                    recordedAudioPaths.add(ttsAudioPath); // Save TTS audio path
+                    handler.post(() -> {
+                        isWaitingForUser = true;
+                        setStatusText("\uD83C\uDFA4 Record...");
+                        startUserRecording(); // Now record user audio
+                    });
+                });
+            } else {
+                throw new IOException("Failed to synthesize TTS to file");
+            }
+        } catch (Exception e) {
+            Log.e("Recording", "Failed to record TTS audio", e);
+            stopRecordingSession();
+        }
     }
 
     private boolean requestAudioFocus() {
@@ -478,6 +527,11 @@ public class RecordingFragment extends Fragment {
             isSpeaking = false;
         }
 
+        if (ttsMediaPlayer != null) {
+            ttsMediaPlayer.release();
+            ttsMediaPlayer = null;
+        }
+
         stopUserRecording();
 
         handler.post(() -> {
@@ -499,7 +553,7 @@ public class RecordingFragment extends Fragment {
     private void startUserRecording() {
         try {
             File outputDir = requireContext().getCacheDir();
-            File outputFile = File.createTempFile("user_audio_" + System.currentTimeMillis(), ".m4a", outputDir);
+            File outputFile = File.createTempFile(USER_AUDIO_PREFIX + System.currentTimeMillis(), ".m4a", outputDir);
             currentRecordingPath = outputFile.getAbsolutePath();
 
             mediaRecorder = new MediaRecorder();
@@ -561,20 +615,6 @@ public class RecordingFragment extends Fragment {
         } finally {
             extractor.release();
         }
-    }
-
-    private void speakCurrentSentence() {
-        if (tts == null || !isCurrentSentenceIndexValid()) {
-            return;
-        }
-
-        Sentence sentence = sentences.get(currentSentenceIndex);
-        Bundle params = new Bundle();
-        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID);
-
-        handler.postDelayed(() -> {
-            tts.speak(sentence.text, TextToSpeech.QUEUE_FLUSH, params, UTTERANCE_ID);
-        }, TTS_WARMUP_DELAY);
     }
 
     private void loadPassageDataFromFile() {
@@ -791,7 +831,6 @@ public class RecordingFragment extends Fragment {
         String outputPath = null;
 
         try {
-            // Change to use app's internal storage
             File outputDir = new File(requireContext().getFilesDir(), "FluentEnglishRecordings");
             if (!outputDir.exists() && !outputDir.mkdirs()) {
                 throw new IOException("Failed to create output directory");
@@ -801,7 +840,6 @@ public class RecordingFragment extends Fragment {
             outputPath = new File(outputDir,
                     safeTitle + "_" + System.currentTimeMillis() / 1000 + ".m4a").getAbsolutePath();
 
-            // Rest of the method remains the same...
             muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
             int trackIndex = -1;
             long totalDurationUs = 0;
@@ -868,6 +906,7 @@ public class RecordingFragment extends Fragment {
 
         return outputPath;
     }
+
     private void saveRecordingToStorage(String filePath) {
         try {
             SharedPreferences prefs = requireContext().getSharedPreferences("Recordings", Context.MODE_PRIVATE);
@@ -1032,8 +1071,10 @@ public class RecordingFragment extends Fragment {
             tts.setOnUtteranceProgressListener(null);
             tts.shutdown();
         }
+        if (ttsMediaPlayer != null) {
+            ttsMediaPlayer.release();
+        }
         handler.removeCallbacksAndMessages(null);
         requireContext().unregisterReceiver(networkChangeReceiver);
     }
-
 }
