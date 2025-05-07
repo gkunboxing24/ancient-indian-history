@@ -1,4 +1,4 @@
-package com.example.fluentenglishin60days;
+package com.spoka.english;
 
 import android.Manifest;
 import android.content.Context;
@@ -13,12 +13,10 @@ import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
-import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.os.Bundle;
-import android.os.Environment;
 import android.os.Handler;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
@@ -27,6 +25,7 @@ import android.text.Layout;
 import android.text.Spannable;
 import android.text.SpannableString;
 import android.text.style.BackgroundColorSpan;
+import android.text.style.ForegroundColorSpan;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -46,8 +45,6 @@ import androidx.fragment.app.Fragment;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -59,44 +56,48 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.UUID;
 
-public class RecordingFragment extends Fragment {
+public class ConversationRecordingFragment extends Fragment {
 
     // Constants
     private static final String ARG_SELECTED_TITLE = "selectedTitle";
     private static final String ARG_ACTIVITY_TYPE = "activityType";
     private static final String UTTERANCE_ID = "ttsUtterance";
     private static final int REQUEST_RECORD_AUDIO_PERMISSION = 200;
-    private static final String FEMALE_VOICE_OFFLINE = "en-us-x-tpc-local";
-    private static final String FEMALE_VOICE_ONLINE = "en-us-x-tpc-network";
-    private static final String MALE_VOICE_OFFLINE = "en-us-x-iom-local";
-    private static final String MALE_VOICE_ONLINE = "en-us-x-iom-network";
     private static final long MIN_PAUSE_DURATION = 1000;
     private static final long MAX_PAUSE_DURATION = 10000;
     private static final long TTS_WARMUP_DELAY = 200;
     private static final long AUDIO_FOCUS_DELAY = 200;
+    private static final int COLOR_PERSON_A = Color.parseColor("#2196F3");
+    private static final int COLOR_PERSON_B = Color.parseColor("#4CAF50");
+    private static final float DEFAULT_SPEECH_RATE = 1.25f;
     private static final int BLINK_INTERVAL = 500;
     private static final int COLOR_RED = Color.RED;
     private static final int COLOR_TRANSPARENT = Color.TRANSPARENT;
-    private static final String TTS_AUDIO_PREFIX = "tts_";
-    private static final String USER_AUDIO_PREFIX = "user_";
+
+    // Voice constants
+    private static final String US_MALE = "en-us-x-iom"; // Will append -network/-local
+    private static final String US_FEMALE = "en-us-x-tpc"; // Will append -network/-local
+    private static final String UK_MALE = "en-gb-x-gbb"; // Will append -network/-local
+    private static final String UK_FEMALE = "en-gb-x-gba"; // Will append -network/-local
+    private static final String IN_MALE = "en-in-x-ene"; // Will append -network/-local
+    private static final String IN_FEMALE = "en-in-x-ena"; // Will append -network/-local
 
     // UI Components
     private TextView passageContent;
     private TextView recordingStatus;
-    private ImageButton micButton, stopButton, voiceSelectionButton, recordingBarButton;
+    private ImageButton micButton, stopButton, recordingBarButton, voiceSelectionButton;
     private ScrollView scrollView;
 
     // Text-to-Speech
     private TextToSpeech tts;
     private Handler handler = new Handler();
-    private boolean useMaleVoice = false;
     private boolean voiceAvailable = false;
     private boolean voicesLoaded = false;
     private boolean loadingVoices = false;
     private long lastTtsDuration = MIN_PAUSE_DURATION;
     private long ttsStartTime = 0;
+    private String currentLanguage = "US-English"; // Default language
 
     // Passage Data
     private List<String> passageTitles = new ArrayList<>();
@@ -126,7 +127,6 @@ public class RecordingFragment extends Fragment {
     private boolean isProcessingRecording = false;
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener audioFocusChangeListener;
-    private MediaPlayer ttsMediaPlayer;
 
     // Network Monitoring
     private BroadcastReceiver networkChangeReceiver = new BroadcastReceiver() {
@@ -146,16 +146,18 @@ public class RecordingFragment extends Fragment {
         int start;
         int end;
         String text;
+        boolean isPersonA;
 
-        public Sentence(int start, int end, String text) {
+        public Sentence(int start, int end, String text, boolean isPersonA) {
             this.start = start;
             this.end = end;
             this.text = text;
+            this.isPersonA = isPersonA;
         }
     }
 
-    public static RecordingFragment newInstance(String selectedTitle, String activityType) {
-        RecordingFragment fragment = new RecordingFragment();
+    public static ConversationRecordingFragment newInstance(String selectedTitle, String activityType) {
+        ConversationRecordingFragment fragment = new ConversationRecordingFragment();
         Bundle args = new Bundle();
         args.putString(ARG_SELECTED_TITLE, selectedTitle);
         args.putString(ARG_ACTIVITY_TYPE, activityType);
@@ -184,32 +186,24 @@ public class RecordingFragment extends Fragment {
 
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container, Bundle savedInstanceState) {
-        View view = inflater.inflate(R.layout.fragment_recording, container, false);
+        View view = inflater.inflate(R.layout.fragment_conversation_recording, container, false);
 
         scrollView = view.findViewById(R.id.scrollView);
         passageContent = view.findViewById(R.id.passageContent);
         recordingStatus = view.findViewById(R.id.recordingStatus);
         micButton = view.findViewById(R.id.micButton);
         stopButton = view.findViewById(R.id.stopButton);
-        voiceSelectionButton = view.findViewById(R.id.voiceSelectionButton);
         recordingBarButton = view.findViewById(R.id.recordingbar);
+        voiceSelectionButton = view.findViewById(R.id.voiceSelectionButton);
 
         setStatusText("Initializing...");
         micButton.setEnabled(false);
         stopButton.setVisibility(View.GONE);
 
-        voiceSelectionButton.setOnClickListener(v -> {
-            stopRecordingSession();
-            showVoiceSelectionDialog();
-        });
-
         micButton.setOnClickListener(v -> startRecordingSession());
         stopButton.setOnClickListener(v -> showStopRecordingConfirmation());
-
-        recordingBarButton.setOnClickListener(v -> {
-            handleFragmentSwitch();
-            navigateToSavedConversations();
-        });
+        recordingBarButton.setOnClickListener(v -> handleFragmentSwitch());
+        voiceSelectionButton.setOnClickListener(v -> showVoiceSelectionDialog());
 
         loadPassageDataFromFile();
         updateContent();
@@ -223,11 +217,8 @@ public class RecordingFragment extends Fragment {
     private void initializeTts() {
         tts = new TextToSpeech(requireContext(), status -> {
             if (status == TextToSpeech.SUCCESS) {
-                int langResult = tts.setLanguage(Locale.US);
-                if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    Log.e("TTS", "Language not supported");
-                    showErrorDialog("English language pack not available");
-                }
+                setLanguageForCurrentSelection();
+                tts.setSpeechRate(DEFAULT_SPEECH_RATE);
 
                 tts.playSilentUtterance(100, TextToSpeech.QUEUE_FLUSH, "warmup");
 
@@ -274,7 +265,7 @@ public class RecordingFragment extends Fragment {
                                         if (isCurrentSentenceIndexValid() && currentSentenceIndex < sentences.size() - 1) {
                                             currentSentenceIndex++;
                                             highlightCurrentSentence();
-                                            recordAndPlayTtsAudio();
+                                            speakCurrentSentence();
                                         } else {
                                             stopRecordingSession();
                                             combineAndSaveRecordings();
@@ -308,6 +299,61 @@ public class RecordingFragment extends Fragment {
                 showErrorDialog("Text-to-speech initialization failed");
             }
         }, "com.google.android.tts");
+    }
+
+    private void showVoiceSelectionDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(requireContext());
+        builder.setTitle("Select Voice");
+
+        String[] voiceOptions = getResources().getStringArray(R.array.voice_types);
+        int selectedIndex = getCurrentLanguageIndex();
+
+        builder.setSingleChoiceItems(voiceOptions, selectedIndex, (dialog, which) -> {
+            switch (which) {
+                case 0:
+                    currentLanguage = "US-English";
+                    break;
+                case 1:
+                    currentLanguage = "UK-English";
+                    break;
+                case 2:
+                    currentLanguage = "IN-English";
+                    break;
+            }
+
+            if (tts != null) {
+                setLanguageForCurrentSelection();
+                loadAvailableVoices();
+            }
+            dialog.dismiss();
+        });
+
+        builder.setNegativeButton("Cancel", null);
+        builder.show();
+    }
+
+    private int getCurrentLanguageIndex() {
+        switch (currentLanguage) {
+            case "UK-English": return 1;
+            case "IN-English": return 2;
+            default: return 0; // US-English as default
+        }
+    }
+
+    private void setLanguageForCurrentSelection() {
+        Locale locale = Locale.US;
+        switch (currentLanguage) {
+            case "UK-English":
+                locale = Locale.UK;
+                break;
+            case "IN-English":
+                locale = new Locale("en", "IN");
+                break;
+        }
+        int result = tts.setLanguage(locale);
+        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            Log.e("TTS", "Language not supported");
+        }
     }
 
     private void startBlinkingStopButton() {
@@ -365,7 +411,7 @@ public class RecordingFragment extends Fragment {
             }
 
             requireActivity().runOnUiThread(() -> {
-                voiceAvailable = setPreferredVoice(useMaleVoice);
+                voiceAvailable = setPreferredVoices();
                 voicesLoaded = true;
                 loadingVoices = false;
 
@@ -379,29 +425,31 @@ public class RecordingFragment extends Fragment {
         }).start();
     }
 
-    private boolean setPreferredVoice(boolean malePreferred) {
+    private boolean setPreferredVoices() {
         if (tts == null) return false;
 
         tts.stop();
         isSpeaking = false;
 
-        if (isNetworkAvailable()) {
-            if (malePreferred) {
-                if (setVoice(MALE_VOICE_ONLINE)) return true;
-                if (setVoice(MALE_VOICE_OFFLINE)) return true;
-            } else {
-                if (setVoice(FEMALE_VOICE_ONLINE)) return true;
-                if (setVoice(FEMALE_VOICE_OFFLINE)) return true;
-            }
+        String maleBase = US_MALE;
+        String femaleBase = US_FEMALE;
+
+        switch (currentLanguage) {
+            case "UK-English":
+                maleBase = UK_MALE;
+                femaleBase = UK_FEMALE;
+                break;
+            case "IN-English":
+                maleBase = IN_MALE;
+                femaleBase = IN_FEMALE;
+                break;
         }
 
-        if (malePreferred) {
-            if (setVoice(MALE_VOICE_OFFLINE)) return true;
-        } else {
-            if (setVoice(FEMALE_VOICE_OFFLINE)) return true;
-        }
+        // Try online voices first, then offline
+        boolean maleAvailable = setVoice(maleBase + "-network") || setVoice(maleBase + "-local");
+        boolean femaleAvailable = setVoice(femaleBase + "-network") || setVoice(femaleBase + "-local");
 
-        return setDefaultVoice();
+        return maleAvailable && femaleAvailable;
     }
 
     private boolean setVoice(String voiceName) {
@@ -410,15 +458,15 @@ public class RecordingFragment extends Fragment {
 
         for (Voice voice : voices) {
             if (voice.getName().equals(voiceName)) {
-                return tts.setVoice(voice) == TextToSpeech.SUCCESS;
+                int result = tts.setVoice(voice);
+                if (result == TextToSpeech.SUCCESS) {
+                    Log.d("TTS", "Voice set successfully: " + voiceName);
+                    return true;
+                }
             }
         }
+        Log.d("TTS", "Voice not available: " + voiceName);
         return false;
-    }
-
-    private boolean setDefaultVoice() {
-        return tts.getDefaultVoice() != null &&
-                tts.setVoice(tts.getDefaultVoice()) == TextToSpeech.SUCCESS;
     }
 
     private void startRecordingSession() {
@@ -450,57 +498,12 @@ public class RecordingFragment extends Fragment {
 
                 currentSentenceIndex = 0;
                 highlightCurrentSentence();
-                recordAndPlayTtsAudio();
+                speakCurrentSentence();
             } catch (Exception e) {
                 Log.e("Recording", "Failed to start recording session", e);
                 stopRecordingSession();
             }
         }, AUDIO_FOCUS_DELAY);
-    }
-
-    private void recordAndPlayTtsAudio() {
-        if (!isCurrentSentenceIndexValid()) return;
-
-        Sentence sentence = sentences.get(currentSentenceIndex);
-        try {
-            // Create file for TTS audio
-            File outputDir = requireContext().getCacheDir();
-            File ttsOutputFile = File.createTempFile(TTS_AUDIO_PREFIX + System.currentTimeMillis(), ".m4a", outputDir);
-            String ttsAudioPath = ttsOutputFile.getAbsolutePath();
-
-            // Setup TTS to output to file
-            Bundle params = new Bundle();
-            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID);
-            params.putString(TextToSpeech.Engine.KEY_PARAM_VOLUME, "1.0");
-
-            // Record TTS to file
-            int result = tts.synthesizeToFile(sentence.text, params, ttsOutputFile, UTTERANCE_ID);
-            if (result == TextToSpeech.SUCCESS) {
-                // Play the recorded TTS audio
-                if (ttsMediaPlayer != null) {
-                    ttsMediaPlayer.release();
-                }
-                ttsMediaPlayer = new MediaPlayer();
-                ttsMediaPlayer.setDataSource(ttsAudioPath);
-                ttsMediaPlayer.prepare();
-                ttsMediaPlayer.start();
-
-                ttsMediaPlayer.setOnCompletionListener(mp -> {
-                    mp.release();
-                    recordedAudioPaths.add(ttsAudioPath); // Save TTS audio path
-                    handler.post(() -> {
-                        isWaitingForUser = true;
-                        setStatusText("\uD83C\uDFA4 Record...");
-                        startUserRecording(); // Now record user audio
-                    });
-                });
-            } else {
-                throw new IOException("Failed to synthesize TTS to file");
-            }
-        } catch (Exception e) {
-            Log.e("Recording", "Failed to record TTS audio", e);
-            stopRecordingSession();
-        }
     }
 
     private boolean requestAudioFocus() {
@@ -527,11 +530,6 @@ public class RecordingFragment extends Fragment {
             isSpeaking = false;
         }
 
-        if (ttsMediaPlayer != null) {
-            ttsMediaPlayer.release();
-            ttsMediaPlayer = null;
-        }
-
         stopUserRecording();
 
         handler.post(() -> {
@@ -553,7 +551,7 @@ public class RecordingFragment extends Fragment {
     private void startUserRecording() {
         try {
             File outputDir = requireContext().getCacheDir();
-            File outputFile = File.createTempFile(USER_AUDIO_PREFIX + System.currentTimeMillis(), ".m4a", outputDir);
+            File outputFile = File.createTempFile("user_audio_" + System.currentTimeMillis(), ".m4a", outputDir);
             currentRecordingPath = outputFile.getAbsolutePath();
 
             mediaRecorder = new MediaRecorder();
@@ -617,8 +615,56 @@ public class RecordingFragment extends Fragment {
         }
     }
 
+    private void speakCurrentSentence() {
+        if (tts == null || !isCurrentSentenceIndexValid()) {
+            return;
+        }
+
+        tts.setSpeechRate(DEFAULT_SPEECH_RATE);
+
+        Sentence sentence = sentences.get(currentSentenceIndex);
+        Bundle params = new Bundle();
+        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, UTTERANCE_ID);
+
+        setVoiceForPerson(sentence.isPersonA);
+
+        String textToSpeak = sentence.text.replaceFirst("^Person [AB]:\\s*", "");
+
+        handler.postDelayed(() -> {
+            tts.speak(textToSpeak, TextToSpeech.QUEUE_FLUSH, params, UTTERANCE_ID);
+        }, TTS_WARMUP_DELAY);
+    }
+
+    private void setVoiceForPerson(boolean isPersonA) {
+        String maleBase = US_MALE;
+        String femaleBase = US_FEMALE;
+
+        switch (currentLanguage) {
+            case "UK-English":
+                maleBase = UK_MALE;
+                femaleBase = UK_FEMALE;
+                break;
+            case "IN-English":
+                maleBase = IN_MALE;
+                femaleBase = IN_FEMALE;
+                break;
+        }
+
+        if (isPersonA) {
+            // Try online voice first, then offline
+            if (!setVoice(maleBase + "-network")) {
+                setVoice(maleBase + "-local");
+            }
+        } else {
+            // Try online voice first, then offline
+            if (!setVoice(femaleBase + "-network")) {
+                setVoice(femaleBase + "-local");
+            }
+        }
+    }
+
     private void loadPassageDataFromFile() {
-        InputStream inputStream = getResources().openRawResource(R.raw.passages);
+        InputStream inputStream = getResources().openRawResource(R.raw.conversation_passages);
         BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
         StringBuilder contentBuilder = new StringBuilder();
         String line;
@@ -626,6 +672,12 @@ public class RecordingFragment extends Fragment {
             String title = "";
             boolean isTitleFound = false;
             while ((line = reader.readLine()) != null) {
+                line = line.trim();
+
+                // Skip subcategory lines
+                if (line.startsWith("#")) {
+                    continue;
+                }
                 if (line.startsWith("Title:")) {
                     if (isTitleFound) {
                         passages.add(contentBuilder.toString().trim());
@@ -657,6 +709,7 @@ public class RecordingFragment extends Fragment {
                 passageContent.setText(spannableText);
 
                 parseSentences(passageText);
+                colorizePersons();
 
                 if (voicesLoaded && voiceAvailable) {
                     micButton.setEnabled(true);
@@ -667,22 +720,57 @@ public class RecordingFragment extends Fragment {
 
     private void parseSentences(String text) {
         sentences.clear();
-        String[] rawSentences = text.split("(?<=[.!?])\\s+");
+        String[] rawLines = text.split("\n");
         int currentPosition = 0;
 
-        for (String sentence : rawSentences) {
-            int start = text.indexOf(sentence, currentPosition);
-            if (start == -1) start = currentPosition;
-            int end = start + sentence.length();
-            sentences.add(new Sentence(start, end, sentence));
-            currentPosition = end;
+        for (String line : rawLines) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue;  // Skip empty lines and subcategory markers
+            }
+
+            boolean isPersonA = line.startsWith("Person A:");
+            boolean isPersonB = line.startsWith("Person B:");
+
+            if (isPersonA || isPersonB) {
+                int start = text.indexOf(line, currentPosition);
+                if (start == -1) start = currentPosition;
+                int end = start + line.length();
+
+                int colonPos = line.indexOf(":");
+                if (colonPos != -1) {
+                    sentences.add(new Sentence(start, end, line, isPersonA));
+                }
+                currentPosition = end;
+            }
         }
 
         if (sentences.isEmpty() && !text.isEmpty()) {
-            sentences.add(new Sentence(0, text.length(), text));
+            sentences.add(new Sentence(0, text.length(), text, false));
         }
 
         currentSentenceIndex = 0;
+    }
+
+    private void colorizePersons() {
+        if (spannableText == null) return;
+
+        for (Sentence sentence : sentences) {
+            if (sentence.isPersonA || !sentence.isPersonA) {
+                int colonPos = sentence.text.indexOf(":");
+                if (colonPos != -1) {
+                    int personTextEnd = sentence.start + colonPos + 1;
+                    int color = sentence.isPersonA ? COLOR_PERSON_A : COLOR_PERSON_B;
+                    spannableText.setSpan(
+                            new ForegroundColorSpan(color),
+                            sentence.start,
+                            personTextEnd,
+                            Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+                    );
+                }
+            }
+        }
+        passageContent.setText(spannableText);
     }
 
     private void highlightCurrentSentence() {
@@ -766,13 +854,12 @@ public class RecordingFragment extends Fragment {
                     }
                 })
                 .setNegativeButton("No", (dialog, which) -> {
-                    for (String path : recordedAudioPaths) {
-                        new File(path).delete();
-                    }
-                    recordedAudioPaths.clear();
+                    cleanupRecordings();
                     resetFragment();
                 })
-                .setCancelable(false)
+                .setOnCancelListener(dialog -> {
+                    resetFragment();
+                })
                 .show();
     }
 
@@ -950,16 +1037,27 @@ public class RecordingFragment extends Fragment {
 
     private void handleFragmentSwitch() {
         if (isRecording || isSpeaking || isUserRecording) {
-            stopRecordingSession();
-            showRecordingStoppedToast();
-
-            for (String path : recordedAudioPaths) {
-                new File(path).delete();
-            }
-            recordedAudioPaths.clear();
-
-            resetFragment();
+            new AlertDialog.Builder(requireContext())
+                    .setTitle("Stop Recording")
+                    .setMessage("You're currently recording. Do you want to stop and switch?")
+                    .setPositiveButton("Yes", (dialog, which) -> {
+                        stopRecordingSession();
+                        showRecordingStoppedToast();
+                        cleanupRecordings();
+                        navigateToSavedConversations();
+                    })
+                    .setNegativeButton("No", null)
+                    .show();
+        } else {
+            navigateToSavedConversations();
         }
+    }
+
+    private void cleanupRecordings() {
+        for (String path : recordedAudioPaths) {
+            new File(path).delete();
+        }
+        recordedAudioPaths.clear();
     }
 
     private void showRecordingStoppedToast() {
@@ -976,24 +1074,6 @@ public class RecordingFragment extends Fragment {
         stopButton.setVisibility(View.GONE);
     }
 
-    private void showVoiceSelectionDialog() {
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Select Voice")
-                .setSingleChoiceItems(
-                        new String[]{"Female Voice", "Male Voice"},
-                        useMaleVoice ? 1 : 0,
-                        (dialog, which) -> {
-                            boolean newMalePreference = (which == 1);
-                            if (newMalePreference != useMaleVoice) {
-                                useMaleVoice = newMalePreference;
-                                voiceAvailable = setPreferredVoice(useMaleVoice);
-                                dialog.dismiss();
-                            }
-                        })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
     private void showErrorDialog(String message) {
         new AlertDialog.Builder(requireContext())
                 .setTitle("Error")
@@ -1004,7 +1084,7 @@ public class RecordingFragment extends Fragment {
 
     private void showVoiceNotAvailableToast() {
         Toast.makeText(requireContext(),
-                "Preferred voice not available. Using default voice.",
+                "Preferred voices not available. Using default voices.",
                 Toast.LENGTH_LONG).show();
     }
 
@@ -1051,13 +1131,7 @@ public class RecordingFragment extends Fragment {
         if (isRecording || isSpeaking || isUserRecording) {
             stopRecordingSession();
             showRecordingStoppedToast();
-
-            for (String path : recordedAudioPaths) {
-                new File(path).delete();
-            }
-            recordedAudioPaths.clear();
-
-            resetFragment();
+            cleanupRecordings();
         }
     }
 
@@ -1066,13 +1140,12 @@ public class RecordingFragment extends Fragment {
         super.onDestroyView();
         stopRecordingSession();
         stopBlinkingStopButton();
+        cleanupRecordings();
+
         if (tts != null) {
             tts.stop();
             tts.setOnUtteranceProgressListener(null);
             tts.shutdown();
-        }
-        if (ttsMediaPlayer != null) {
-            ttsMediaPlayer.release();
         }
         handler.removeCallbacksAndMessages(null);
         requireContext().unregisterReceiver(networkChangeReceiver);
