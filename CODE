@@ -1,5 +1,6 @@
 package com.spoka.english;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -52,9 +53,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-import android.view.Gravity;
-import android.widget.LinearLayout;
-
 public class ConversationRecordingFragment extends Fragment {
 
     private static final String ARG_SELECTED_TITLE = "selectedTitle";
@@ -73,7 +71,7 @@ public class ConversationRecordingFragment extends Fragment {
 
     private LinearLayout passageContainer;
     private TextView statusText;
-    private ImageButton playButton, pauseButton, nextSentenceButton, prevSentenceButton, voiceSelectionButton;
+    private ImageButton micButton, pauseButton, voiceSelectionButton;
     private Spinner speedSelector;
     private ScrollView scrollView;
     private TextToSpeech tts;
@@ -90,6 +88,7 @@ public class ConversationRecordingFragment extends Fragment {
     private long sentenceStartTime = 0;
     private boolean isFragmentVisible = false;
     private boolean isFragmentDestroyed = false;
+    private boolean isLessonComplete = false;
 
     private String selectedTitle;
     private String activityType;
@@ -111,6 +110,10 @@ public class ConversationRecordingFragment extends Fragment {
     private boolean isRecording = false;
     private boolean isPlayingRecording = false;
     private boolean isPlayingTTSForRecording = false;
+
+    // Store state when user interrupts recording to play a specific sentence
+    private boolean wasRecordingInterrupted = false;
+    private int interruptedSentenceIndex = -1;
 
     private class Sentence {
         String text;
@@ -159,22 +162,54 @@ public class ConversationRecordingFragment extends Fragment {
         initializeTts();
     }
 
+    // Add this method for automatic cleanup of old files
+    private void cleanupOldRecordings() {
+        Context context = getContext();
+        if (context == null) return;
+
+        try {
+            File cacheDir = context.getCacheDir();
+            File[] files = cacheDir.listFiles((dir, name) -> name.startsWith("temp_recording_"));
+            if (files != null) {
+                long now = System.currentTimeMillis();
+                for (File file : files) {
+                    // Delete files older than 24 hours
+                    if (now - file.lastModified() > 24 * 3600000) {
+                        file.delete();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e("Recording", "Cleanup failed", e);
+        }
+    }
+
+
     @Override
     public void onResume() {
         super.onResume();
         isFragmentVisible = true;
         resetAudio();
+        cleanupOldRecordings();
     }
 
     @Override
     public void onPause() {
         super.onPause();
         isFragmentVisible = false;
-        pauseAudio();
-        stopRecording();
-        stopAllRecordingsPlayback();
+
+        // Always reset when fragment is paused (switched away from)
+        resetFragment();
     }
 
+    @Override
+    public void onHiddenChanged(boolean hidden) {
+        super.onHiddenChanged(hidden);
+        if (hidden) {
+            // Fragment is being hidden/switched away from
+            resetFragment();
+        }
+    }
     private void initializeTts() {
         if (tts != null || !isAdded() || getContext() == null || isFragmentDestroyed) return;
 
@@ -204,7 +239,7 @@ public class ConversationRecordingFragment extends Fragment {
                                 // Normal TTS playback
                                 isSpeaking = true;
                                 sentenceStartTime = System.currentTimeMillis();
-                                playButton.setVisibility(View.GONE);
+                                micButton.setVisibility(View.GONE);
                                 pauseButton.setVisibility(View.VISIBLE);
                                 setStatusText("\uD83D\uDD0A Listen Carefully...");
                                 scrollToCurrentSentence();
@@ -248,16 +283,25 @@ public class ConversationRecordingFragment extends Fragment {
                                                 updateRecordingButtons();
                                                 speakCurrentSentence();
                                             } else {
-                                                currentSentenceIndex = 0;
-                                                highlightCurrentSentence();
-                                                updateRecordingButtons();
-                                                speakCurrentSentence();
+                                                // Lesson completed
+                                                isLessonComplete = true;
+
+                                                // Set refresh icon
+                                                micButton.setImageResource(R.drawable.ic_refresh);
+                                                micButton.setVisibility(View.VISIBLE);
+                                                pauseButton.setVisibility(View.GONE);
+                                                setStatusText("Lesson Complete! Check your recordings.");
+                                                shouldContinuePlayback = false;
+                                                isSpeaking = false;
+
+                                                // Remove highlight from current sentence after lesson completion
+                                                removeCurrentSentenceHighlight();
                                             }
                                         }
                                     }, lastUtteranceDuration);
                                 } else {
                                     isSpeaking = false;
-                                    playButton.setVisibility(View.VISIBLE);
+                                    micButton.setVisibility(View.VISIBLE);
                                     pauseButton.setVisibility(View.GONE);
                                     setStatusText("Ready");
                                 }
@@ -276,7 +320,7 @@ public class ConversationRecordingFragment extends Fragment {
 
                             if (UTTERANCE_ID.equals(utteranceId)) {
                                 isSpeaking = false;
-                                playButton.setVisibility(View.VISIBLE);
+                                micButton.setVisibility(View.VISIBLE);
                                 pauseButton.setVisibility(View.GONE);
                                 setStatusText("Error occurred");
                             } else if (RECORDING_UTTERANCE_ID.equals(utteranceId)) {
@@ -293,6 +337,33 @@ public class ConversationRecordingFragment extends Fragment {
                 showErrorDialog("Text-to-speech initialization failed");
             }
         }, "com.google.android.tts");
+    }
+
+    private void removeCurrentSentenceHighlight() {
+        if (sentences.isEmpty() || currentSentenceIndex >= sentences.size()) return;
+
+        // Remove highlight only from the current sentence
+        Sentence sentence = sentences.get(currentSentenceIndex);
+        if (sentence.textView != null) {
+            // Remove highlight from text
+            SpannableString spannable = new SpannableString(sentence.text);
+            int color = sentence.isPersonA ? colorPersonA : colorPersonB;
+
+            // Color only "Person A:" or "Person B:" part
+            spannable.setSpan(new ForegroundColorSpan(color),
+                    0, 9,
+                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+            sentence.textView.setText(spannable);
+
+            // Remove highlight from play button - set circular background instead of color
+            if (sentence.playButton != null) {
+                sentence.playButton.setBackgroundResource(R.drawable.circular_button);
+            }
+        }
+
+        // Also update recording buttons to ensure proper display
+        updateRecordingButtons();
     }
 
     private void setLanguageForCurrentSelection() {
@@ -319,19 +390,21 @@ public class ConversationRecordingFragment extends Fragment {
             return;
         }
 
-        // Scroll to the current sentence
+        // Get the current sentence view
         View sentenceView = passageContainer.getChildAt(currentSentenceIndex);
         if (sentenceView != null) {
-            int[] location = new int[2];
-            sentenceView.getLocationOnScreen(location);
-            int y = location[1];
-
+            // Get the position relative to the scroll view
             int scrollViewHeight = scrollView.getHeight();
-            int desiredY = y - (scrollViewHeight / 3);
+            int desiredY = sentenceView.getTop() - (scrollViewHeight / 3);
 
-            scrollView.smoothScrollTo(0, Math.max(0, desiredY));
+            // Make sure we don't scroll beyond the content
+            int maxScroll = passageContainer.getHeight() - scrollViewHeight;
+            desiredY = Math.max(0, Math.min(desiredY, maxScroll));
+
+            scrollView.smoothScrollTo(0, desiredY);
         }
     }
+
     private void setStatusText(String text) {
         if (statusText != null) {
             statusText.setText(text);
@@ -339,7 +412,14 @@ public class ConversationRecordingFragment extends Fragment {
     }
 
     private void loadAvailableVoices() {
-        if (loadingVoices || !isAdded() || isFragmentDestroyed) return;
+        // Get context and activity first for safety checks
+        Context context = getContext();
+        Activity activity = getActivity();
+
+        if (loadingVoices || context == null || activity == null || activity.isFinishing() ||
+                activity.isDestroyed() || !isAdded() || isFragmentDestroyed) {
+            return;
+        }
 
         loadingVoices = true;
         voiceAvailable = false;
@@ -352,17 +432,31 @@ public class ConversationRecordingFragment extends Fragment {
                     retries++;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    loadingVoices = false;
                     return;
                 }
             }
 
-            if (!isAdded() || isFragmentDestroyed) {
+            // Get fresh context/activity references for UI thread
+            Context uiContext = getContext();
+            Activity uiActivity = getActivity();
+
+            if (uiContext == null || uiActivity == null || uiActivity.isFinishing() ||
+                    uiActivity.isDestroyed() || !isAdded() || isFragmentDestroyed) {
                 loadingVoices = false;
                 return;
             }
 
-            requireActivity().runOnUiThread(() -> {
-                if (!isAdded() || getContext() == null || isFragmentDestroyed) return;
+            uiActivity.runOnUiThread(() -> {
+                // Final safety check in UI thread
+                Context finalContext = getContext();
+                Activity finalActivity = getActivity();
+
+                if (finalContext == null || finalActivity == null || finalActivity.isFinishing() ||
+                        finalActivity.isDestroyed() || !isAdded() || isFragmentDestroyed) {
+                    loadingVoices = false;
+                    return;
+                }
 
                 voiceAvailable = setDefaultVoice();
                 voicesLoaded = true;
@@ -370,13 +464,19 @@ public class ConversationRecordingFragment extends Fragment {
 
                 if (voiceAvailable) {
                     Log.d("TTS", "Voices loaded successfully");
-                    if (passages.size() > currentIndex) {
-                        playButton.setEnabled(true);
+                    if (passages.size() > currentIndex && micButton != null) {
+                        micButton.setEnabled(true);
                     }
                 } else {
                     Log.d("TTS", "No voices available");
-                    showVoiceNotAvailableToast();
-                    playButton.setEnabled(false);
+                    // Safe toast - use the finalContext we already checked
+                    Toast.makeText(finalContext,
+                            "Preferred voice not available. Using default voice.",
+                            Toast.LENGTH_LONG).show();
+
+                    if (micButton != null) {
+                        micButton.setEnabled(false);
+                    }
                 }
             });
         }).start();
@@ -390,47 +490,36 @@ public class ConversationRecordingFragment extends Fragment {
         scrollView = view.findViewById(R.id.scrollView);
         passageContainer = view.findViewById(R.id.passageContainer);
         statusText = view.findViewById(R.id.statusText);
-        playButton = view.findViewById(R.id.playButton);
+        micButton = view.findViewById(R.id.micButton);
         pauseButton = view.findViewById(R.id.pauseButton);
         speedSelector = view.findViewById(R.id.speedSelector);
         voiceSelectionButton = view.findViewById(R.id.voiceSelectionButton);
-        nextSentenceButton = view.findViewById(R.id.nextSentenceButton);
-        prevSentenceButton = view.findViewById(R.id.prevSentenceButton);
 
-        playButton.setEnabled(false);
+        micButton.setEnabled(false);
         pauseButton.setVisibility(View.GONE);
 
         loadPassageDataFromFile();
         updateContent();
 
-        playButton.setOnClickListener(v -> playAudio());
+        micButton.setOnClickListener(v -> {
+            if (isLessonComplete) {
+                // Reset the lesson
+                resetLesson();
+            } else {
+                playAudio();
+            }
+        });
         pauseButton.setOnClickListener(v -> pauseAudio());
-
-        nextSentenceButton.setOnClickListener(v -> {
-            if (currentSentenceIndex < sentences.size() - 1) {
-                currentSentenceIndex++;
-                highlightCurrentSentence();
-                updateRecordingButtons();
-                if (isSpeaking) {
-                    speakCurrentSentence();
-                }
-            }
-        });
-
-        prevSentenceButton.setOnClickListener(v -> {
-            if (currentSentenceIndex > 0) {
-                currentSentenceIndex--;
-                highlightCurrentSentence();
-                updateRecordingButtons();
-                if (isSpeaking) {
-                    speakCurrentSentence();
-                }
-            }
-        });
 
         voiceSelectionButton.setOnClickListener(v -> showVoiceSelectionDialog());
 
-        ArrayAdapter<CharSequence> speedAdapter = ArrayAdapter.createFromResource(requireContext(),
+        Context context = getContext();
+        if (context == null) {
+            Log.e("TAG", "Context is null, cannot create speed adapter");
+            return view;
+        }
+
+        ArrayAdapter<CharSequence> speedAdapter = ArrayAdapter.createFromResource(context,
                 R.array.playback_speeds, android.R.layout.simple_spinner_item);
         speedAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         speedSelector.setAdapter(speedAdapter);
@@ -447,11 +536,12 @@ public class ConversationRecordingFragment extends Fragment {
             }
 
             @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
         });
 
         try {
-            Context context = getContext();
+            context = getContext();
             if (context != null) {
                 IntentFilter filter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
                 context.registerReceiver(networkChangeReceiver, filter);
@@ -461,6 +551,131 @@ public class ConversationRecordingFragment extends Fragment {
         }
 
         return view;
+    }
+
+    private void resetOnAccentChange() {
+        // Stop any ongoing playback
+        if (tts != null && isSpeaking) {
+            tts.stop();
+        }
+
+        // Stop recording if active
+        stopRecording();
+
+        // Stop all recording playback
+        stopAllRecordingsPlayback();
+
+        // Delete all recorded files
+        deleteAllRecordings();
+
+        // Reset all states
+        shouldContinuePlayback = false;
+        isSpeaking = false;
+        isPlayingRecording = false;
+        isPlayingTTSForRecording = false;
+        wasRecordingInterrupted = false;
+        isLessonComplete = false;
+
+        // Reset to first sentence
+        currentSentenceIndex = 0;
+
+        // Clear all recording references
+        recordingFiles.clear();
+        mediaPlayers.clear();
+
+        // Update UI
+        micButton.setImageResource(R.drawable.ic_mic);
+        micButton.setVisibility(View.VISIBLE);
+        pauseButton.setVisibility(View.GONE);
+        setStatusText("Voice changed. Ready to start.");
+
+        // Re-highlight the current sentence and update buttons
+        highlightCurrentSentence();
+        updateRecordingButtons();
+    }
+
+    private void resetFragment() {
+        // Stop any ongoing activities
+        if (tts != null && isSpeaking) {
+            tts.stop();
+        }
+
+        stopRecording();
+        stopAllRecordingsPlayback();
+
+        // Delete all recorded files
+        deleteAllRecordings();
+
+        // Reset states
+        shouldContinuePlayback = false;
+        isSpeaking = false;
+        isPlayingRecording = false;
+        isPlayingTTSForRecording = false;
+        wasRecordingInterrupted = false;
+        isLessonComplete = false;
+
+        // Clear all recording references
+        recordingFiles.clear();
+        mediaPlayers.clear();
+
+        // Update UI
+        micButton.setImageResource(R.drawable.ic_mic);
+        micButton.setVisibility(View.VISIBLE);
+        pauseButton.setVisibility(View.GONE);
+        setStatusText("Ready");
+
+        // Update recording buttons to hide all play icons
+        updateRecordingButtons();
+    }
+
+    private void deleteAllRecordings() {
+        Context context = getContext();
+        if (context == null) return;
+
+        try {
+            File cacheDir = context.getCacheDir();
+            if (cacheDir != null && cacheDir.exists()) {
+                File[] files = cacheDir.listFiles((dir, name) ->
+                        name.startsWith("temp_recording_") && name.endsWith(".3gp"));
+
+                if (files != null) {
+                    for (File file : files) {
+                        try {
+                            if (file.exists()) {
+                                file.delete();
+                            }
+                        } catch (SecurityException e) {
+                            Log.e("Recording", "Permission denied to delete file", e);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e("Recording", "Failed to delete recordings", e);
+        }
+    }
+    private void resetLesson() {
+        isLessonComplete = false;
+
+        // Delete all recordings when resetting lesson
+        deleteAllRecordings();
+
+        // Set mic icon
+        micButton.setImageResource(R.drawable.ic_mic);
+        micButton.setVisibility(View.VISIBLE);
+        pauseButton.setVisibility(View.GONE);
+
+        // Clear all recording references
+        recordingFiles.clear();
+        mediaPlayers.clear();
+
+        resetAudio();
+
+        // Highlight the first sentence again
+        highlightCurrentSentence();
+
+        // Update buttons to hide all play icons
+        updateRecordingButtons();
     }
 
     private void showVoiceSelectionDialog() {
@@ -504,7 +719,8 @@ public class ConversationRecordingFragment extends Fragment {
                 if (tts != null) {
                     setLanguageForCurrentSelection();
                 }
-                resetAudio();
+                // Completely reset the fragment when accent changes
+                resetOnAccentChange();
             }
 
             dialog.dismiss();
@@ -575,21 +791,30 @@ public class ConversationRecordingFragment extends Fragment {
                 LinearLayout.LayoutParams.WRAP_CONTENT
         ));
         sentenceLayout.setGravity(Gravity.CENTER_VERTICAL);
-        sentenceLayout.setPadding(0, 12, 0, 12); // Add vertical padding between sentences
+        sentenceLayout.setPadding(0, 12, 0, 12);
+
+        // Add shadow divider to the bottom of each sentence except the last one
+        if (sentence.index < sentences.size() - 1) {
+            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.JELLY_BEAN) {
+                sentenceLayout.setBackgroundDrawable(getResources().getDrawable(R.drawable.shadow_divider));
+            } else {
+                sentenceLayout.setBackground(getResources().getDrawable(R.drawable.shadow_divider));
+            }
+        }
 
         // Create play/pause button
         ImageButton playPauseButton = new ImageButton(getContext());
         playPauseButton.setImageResource(android.R.drawable.ic_media_play);
         playPauseButton.setBackgroundResource(R.drawable.circular_button);
         playPauseButton.setScaleType(ImageButton.ScaleType.CENTER_INSIDE);
-        playPauseButton.setPadding(6, 6, 6, 6); // Reduced internal padding
+        playPauseButton.setPadding(6, 6, 6, 6);
 
         // Set button size with proper margins
-        int buttonSize = 24; // dp
+        int buttonSize = 30;
         float density = getResources().getDisplayMetrics().density;
         int pixelSize = (int) (buttonSize * density);
         LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(pixelSize, pixelSize);
-        buttonParams.setMargins(0, 0, 16, 0); // Increased right margin to 16dp for more spacing
+        buttonParams.setMargins(0, 0, 16, 0);
         playPauseButton.setLayoutParams(buttonParams);
 
         // Set color based on person
@@ -629,9 +854,9 @@ public class ConversationRecordingFragment extends Fragment {
         // Create TextView for the sentence
         TextView sentenceTextView = new TextView(getContext());
         sentenceTextView.setText(sentence.text);
-        sentenceTextView.setTextSize(16); // 16sp text size
+        sentenceTextView.setTextSize(16);
         sentenceTextView.setTypeface(null, Typeface.BOLD);
-        sentenceTextView.setPadding(4, 16, 16, 16); // Added left padding of 4dp
+        sentenceTextView.setPadding(4, 16, 16, 16);
         sentenceTextView.setLayoutParams(new LinearLayout.LayoutParams(
                 0,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -642,12 +867,12 @@ public class ConversationRecordingFragment extends Fragment {
         SpannableString spannable = new SpannableString(sentence.text);
         int color = sentence.isPersonA ? colorPersonA : colorPersonB;
         spannable.setSpan(new ForegroundColorSpan(color),
-                0, 9, // Color only "Person A:" or "Person B:"
+                0, 9,
                 Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
 
         sentenceTextView.setText(spannable);
 
-        // Add views to the layout - PLAY BUTTON FIRST, then TEXT
+        // Add views to the layout
         sentenceLayout.addView(playPauseButton);
         sentenceLayout.addView(sentenceTextView);
 
@@ -659,6 +884,7 @@ public class ConversationRecordingFragment extends Fragment {
         sentence.playButton = playPauseButton;
         sentence.textView = sentenceTextView;
     }
+
     private void resumeRecording(int index) {
         if (mediaPlayers.containsKey(index)) {
             MediaPlayer mediaPlayer = mediaPlayers.get(index);
@@ -703,15 +929,13 @@ public class ConversationRecordingFragment extends Fragment {
                     playButton.setColorFilter(colorPersonB);
                 }
 
-                // Update play/pause state
                 boolean isCurrentlyPlaying = (isPlayingRecording && currentlyPlayingRecording == i);
                 playButton.setSelected(isCurrentlyPlaying);
                 playButton.setImageResource(isCurrentlyPlaying ?
                         android.R.drawable.ic_media_pause :
                         android.R.drawable.ic_media_play);
 
-                // Ensure proper background
-                if (i == currentSentenceIndex) {
+                if (i == currentSentenceIndex && !isLessonComplete) {
                     playButton.setBackgroundColor(getHighlightColor());
                 } else {
                     playButton.setBackgroundResource(R.drawable.circular_button);
@@ -719,8 +943,15 @@ public class ConversationRecordingFragment extends Fragment {
             }
         }
     }
+
     private void highlightCurrentSentence() {
         if (sentences.isEmpty()) return;
+
+        // Don't highlight if lesson is complete
+        if (isLessonComplete) {
+            removeCurrentSentenceHighlight();
+            return;
+        }
 
         // Highlight the current sentence
         for (int i = 0; i < sentences.size(); i++) {
@@ -840,7 +1071,7 @@ public class ConversationRecordingFragment extends Fragment {
             shouldContinuePlayback = false;
             tts.stop();
             isSpeaking = false;
-            playButton.setVisibility(View.VISIBLE);
+            micButton.setVisibility(View.VISIBLE);
             pauseButton.setVisibility(View.GONE);
             setStatusText("Paused");
             stopRecording();
@@ -850,7 +1081,7 @@ public class ConversationRecordingFragment extends Fragment {
     private void resetAudio() {
         shouldContinuePlayback = false;
         isSpeaking = false;
-        playButton.setVisibility(View.VISIBLE);
+        micButton.setVisibility(View.VISIBLE);
         pauseButton.setVisibility(View.GONE);
         currentSentenceIndex = 0;
         highlightCurrentSentence();
@@ -858,6 +1089,12 @@ public class ConversationRecordingFragment extends Fragment {
         stopRecording();
         stopAllRecordingsPlayback();
         updateRecordingButtons();
+
+        // Ensure lesson completion state is reset
+        if (isLessonComplete) {
+            isLessonComplete = false;
+            micButton.setImageResource(R.drawable.ic_mic);
+        }
     }
 
     private boolean setDefaultVoice() {
@@ -926,7 +1163,7 @@ public class ConversationRecordingFragment extends Fragment {
                 parseSentences(passageText);
 
                 if (voicesLoaded && voiceAvailable) {
-                    playButton.setEnabled(true);
+                    micButton.setEnabled(true);
                 }
             }
         }
@@ -949,13 +1186,22 @@ public class ConversationRecordingFragment extends Fragment {
         }
 
         try {
-            File storageDir = requireContext().getExternalFilesDir(Environment.DIRECTORY_MUSIC);
-            if (storageDir != null && !storageDir.exists()) {
-                storageDir.mkdirs();
+            Context context = getContext();
+            if (context == null) return;
+
+            // Check available storage space first
+            File cacheDir = context.getCacheDir();
+            if (cacheDir != null) {
+                long freeSpace = cacheDir.getFreeSpace();
+                if (freeSpace < 10 * 1024 * 1024) { // 5MB minimum
+                    setStatusText("Storage full - cannot record");
+                    Toast.makeText(context, "Storage full. Please free up space.", Toast.LENGTH_LONG).show();
+                    return;
+                }
             }
 
-            String fileName = "recording_" + currentSentenceIndex + "_" + System.currentTimeMillis() + ".3gp";
-            File recordingFile = new File(storageDir, fileName);
+            String fileName = "temp_recording_" + currentSentenceIndex + "_" + System.currentTimeMillis() + ".3gp";
+            File recordingFile = new File(cacheDir, fileName);
 
             mediaRecorder = new MediaRecorder();
             mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
@@ -970,7 +1216,13 @@ public class ConversationRecordingFragment extends Fragment {
 
         } catch (IOException e) {
             Log.e("Recording", "Failed to start recording", e);
-            setStatusText("Recording failed");
+            // Handle storage errors gracefully
+            if (e.getMessage() != null && (e.getMessage().contains("ENOSPC") || e.getMessage().contains("No space"))) {
+                setStatusText("Storage full - cannot record");
+                Toast.makeText(getContext(), "Storage full. Please free up space.", Toast.LENGTH_LONG).show();
+            } else {
+                setStatusText("Recording failed");
+            }
         } catch (Exception e) {
             Log.e("Recording", "Unexpected error starting recording", e);
             setStatusText("Recording failed");
@@ -983,12 +1235,15 @@ public class ConversationRecordingFragment extends Fragment {
                 mediaRecorder.stop();
                 mediaRecorder.release();
 
-                // Save the recording file path
-                File storageDir = requireContext().getExternalFilesDir(Environment.DIRECTORY_MUSIC);
-                if (storageDir != null) {
+                // Save the recording file path from cache directory
+                Context context = getContext();
+                if (context == null) return;
+
+                File cacheDir = context.getCacheDir();
+                if (cacheDir != null) {
                     // Find the latest recording file for this sentence
-                    File[] files = storageDir.listFiles((dir, name) ->
-                            name.startsWith("recording_" + currentSentenceIndex + "_") && name.endsWith(".3gp"));
+                    File[] files = cacheDir.listFiles((dir, name) ->
+                            name.startsWith("temp_recording_" + currentSentenceIndex + "_") && name.endsWith(".3gp"));
 
                     if (files != null && files.length > 0) {
                         // Get the most recent file
@@ -1024,6 +1279,14 @@ public class ConversationRecordingFragment extends Fragment {
             }
         }
 
+        // If we're in the middle of a recording session, remember the state
+        if (isRecording || shouldContinuePlayback) {
+            wasRecordingInterrupted = true;
+            interruptedSentenceIndex = currentSentenceIndex;
+            stopRecording();
+            shouldContinuePlayback = false;
+        }
+
         if (recordingFiles.containsKey(index)) {
             // First play TTS for this sentence, then the user recording
             playTTSForRecording(index);
@@ -1051,6 +1314,16 @@ public class ConversationRecordingFragment extends Fragment {
     private void playUserRecording(int index) {
         if (recordingFiles.containsKey(index)) {
             String filePath = recordingFiles.get(index);
+            File recordingFile = new File(filePath);
+
+
+            // Check if file still exists in cache
+            if (!recordingFile.exists()) {
+                Toast.makeText(getContext(), "Recording not available", Toast.LENGTH_SHORT).show();
+                recordingFiles.remove(index);
+                updateRecordingButtons();
+                return;
+            }
 
             try {
                 MediaPlayer mediaPlayer = new MediaPlayer();
@@ -1060,6 +1333,11 @@ public class ConversationRecordingFragment extends Fragment {
                 mediaPlayer.setOnCompletionListener(mp -> {
                     stopRecordingPlayback(index);
                     updateRecordingButtons();
+
+                    // If recording was interrupted, resume from the same sentence
+                    if (wasRecordingInterrupted) {
+                        resumeFromInterruptedRecording();
+                    }
                 });
 
                 mediaPlayer.start();
@@ -1073,16 +1351,29 @@ public class ConversationRecordingFragment extends Fragment {
 
             } catch (IOException e) {
                 Log.e("Recording", "Failed to play recording: " + e.getMessage());
-                Toast.makeText(getContext(), "Failed to play recording: File not found", Toast.LENGTH_SHORT).show();
-
-                // Remove the invalid file reference
+                Toast.makeText(getContext(), "Recording file not found", Toast.LENGTH_SHORT).show();
                 recordingFiles.remove(index);
                 updateRecordingButtons();
             } catch (Exception e) {
                 Log.e("Recording", "Failed to play recording", e);
                 Toast.makeText(getContext(), "Failed to play recording", Toast.LENGTH_SHORT).show();
             }
+        } else {
+            Toast.makeText(getContext(), "No recording available", Toast.LENGTH_SHORT).show();
         }
+    }
+
+    private void resumeFromInterruptedRecording() {
+        wasRecordingInterrupted = false;
+        currentSentenceIndex = interruptedSentenceIndex;
+        interruptedSentenceIndex = -1;
+
+        highlightCurrentSentence();
+        updateRecordingButtons();
+
+        // Continue with the lesson
+        shouldContinuePlayback = true;
+        speakCurrentSentence();
     }
 
     private void pauseRecording(int index) {
@@ -1138,6 +1429,7 @@ public class ConversationRecordingFragment extends Fragment {
 
         setStatusText("Ready");
     }
+
     private void showErrorDialog(String message) {
         Context context = getContext();
         if (context == null) return;
